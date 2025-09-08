@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 import os
+from os import environ
 import uuid
 from io import BytesIO
 from urllib.parse import urlparse
-
+import sys
+import base64
+import json
+from dotenv import load_dotenv
+load_dotenv()
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from PIL import Image, UnidentifiedImageError
 
 from google import genai
@@ -13,7 +18,13 @@ from google import genai
 # ------------------------------
 # Config
 # ------------------------------
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+try:
+    GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+    if not GOOGLE_API_KEY:
+        raise ValueError("GOOGLE_API_KEY environment variable not set.")
+except Exception as e:
+    print(f"Error: {e}", file=sys.stderr)
+    sys.exit(1)
 DEFAULT_MODEL = os.environ.get("GOOGLE_GENAI_MODEL", "gemini-2.5-flash-image-preview")
 
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "generated")
@@ -147,6 +158,157 @@ def download_images_from_zillow(zillow_url: str) -> tuple[Image.Image, str]:
     """
     # Example implementation; adjust as needed based on actual Zillow URL structures
     return _download_image(zillow_url)
+
+def _scrape_zillow_and_zip(
+    zillow_url: str,
+    target_format: str = "jpeg",
+    target_size: str = "1536",
+) -> tuple[str, int]:
+    """
+    Use a headless browser to open a Zillow listing, click "See all photos",
+    scroll the media wall for a few seconds to load images, collect the image URLs,
+    download them, and save as a zip in OUTPUT_DIR.
+
+    Returns (zip_path, num_images).
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        raise RuntimeError(
+            "playwright is required for Zillow scraping. Install with `pip install playwright` and run `playwright install chromium`."
+        ) from e
+
+    import re
+    import time
+    import zipfile
+
+    # Normalize options
+    target_format = (target_format or "jpeg").lower().strip()
+    if target_format not in {"jpeg", "webp"}:
+        target_format = "jpeg"
+    target_size = (str(target_size) or "1536").strip()
+    if not target_size.isdigit():
+        target_size = "1536"
+
+    # Collect image URLs from page
+    urls: list[str] = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        # Navigate
+        page.goto(zillow_url, wait_until="domcontentloaded", timeout=90_000)
+
+        # Click the "See all photos" button if present
+        try:
+            btn = page.locator('[data-testid="gallery-see-all-photos-button"]')
+            if btn.count() > 0:
+                btn.first.click(timeout=15_000)
+        except Exception:
+            pass  # continue; some listings may already show media wall
+
+        # Wait for media wall
+        page.wait_for_selector('div[data-testid="hollywood-vertical-media-wall"]', timeout=30_000)
+
+        # Scroll window and the media wall container for ~5 seconds to load images
+        start = time.time()
+        while time.time() - start < 5.0:
+            try:
+                page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+                page.locator('div[data-testid="hollywood-vertical-media-wall"]').evaluate(
+                    "el => { el.scrollTop = el.scrollHeight; }"
+                )
+            except Exception:
+                pass
+            time.sleep(0.3)
+
+        # Extract srcset entries for desired format
+        selector = f'div[data-testid="hollywood-vertical-media-wall"] source[type="image/{target_format}"]'
+        try:
+            srcsets = page.eval_on_selector_all(
+                selector,
+                "nodes => nodes.map(n => n.getAttribute('srcset') || '')"
+            )
+        except Exception:
+            srcsets = []
+
+        # Parse the largest URL from each srcset and normalize to target size/format
+        size_re = re.compile(r"_(\d+)\.(?:jpg|jpeg|webp)$", re.IGNORECASE)
+        cand_urls: list[str] = []
+        for srcset in srcsets:
+            if not srcset:
+                continue
+            last_part = srcset.split(',')[-1].strip()
+            # Typically "<url> <width>w" or "<url> <width>x"
+            url = last_part.split(" ")[0]
+            # Force to target size/format
+            url = size_re.sub(f"_{target_size}.{target_format}", url)
+            cand_urls.append(url)
+
+        # De-duplicate while preserving order
+        seen = set()
+        for u in cand_urls:
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
+
+        # Tidy up browser
+        context.close()
+        browser.close()
+
+    if not urls:
+        raise RuntimeError("No images found on Zillow media wall.")
+
+    # Download images and zip them
+    zip_name = f"zillow_images_{uuid.uuid4().hex}.zip"
+    zip_path = os.path.join(OUTPUT_DIR, zip_name)
+
+    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for idx, url in enumerate(urls, start=1):
+            try:
+                r = SESSION.get(url, timeout=30)
+                if r.status_code >= 400:
+                    continue
+                ext = target_format if target_format != "jpeg" else "jpg"
+                zf.writestr(f"images/image_{idx}.{ext}", r.content)
+            except Exception:
+                # Skip problematic images; continue best-effort
+                continue
+
+    # Count entries actually written
+    count = 0
+    with zipfile.ZipFile(zip_path, mode="r") as zf:
+        for info in zf.infolist():
+            if info.filename.lower().endswith((".jpg", ".jpeg", ".webp")):
+                count += 1
+
+    return zip_path, count
+
+@app.route("/zillow/download", methods=["POST"])
+def zillow_download():
+    """
+    POST JSON {"url": "https://www.zillow.com/...", "format": "jpeg|webp", "size": "1536"}
+
+    Opens the Zillow URL, clicks "See all photos", scrolls the media wall for 5s,
+    collects image URLs, downloads them server-side, and returns a zip path.
+    """
+    if not request.is_json:
+        return jsonify(error="Send JSON body."), 400
+    data = request.get_json(silent=True) or {}
+    zurl = (data.get("url") or "").strip()
+    if not zurl:
+        return jsonify(error="url required"), 400
+    target_format = (data.get("format") or "jpeg").strip()
+    target_size = (data.get("size") or "1536").strip()
+
+    try:
+        zip_path, count = _scrape_zillow_and_zip(zurl, target_format, target_size)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+    return jsonify(zip=zip_path, count=count), 200
 
 def find_all_images_in_html(html: str) -> list[str]:
     """
